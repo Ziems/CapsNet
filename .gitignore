@@ -1,0 +1,5 @@
+.idea/
+data/
+epochs/*
+!epochs/.gitkeep
+__pycache__/
