@@ -16,7 +16,7 @@ import data_loader as custom_dl
 
 BATCH_SIZE = 128
 NUM_CLASSES = 10
-NUM_EPOCHS = 20
+NUM_EPOCHS = 100
 NUM_ROUTING_ITERATIONS = 3
 CHANNELS = 3
 
@@ -110,9 +110,12 @@ class CapsuleNet(nn.Module):
         super(CapsuleNet, self).__init__()
 
         self.conv1 = nn.Conv2d(in_channels=CHANNELS, out_channels=512, kernel_size=9, stride=1)
+        self.dropout1 = nn.Dropout2d(0.5)
         self.conv2 = nn.Conv2d(in_channels=512, out_channels=256, kernel_size=9, stride=1, padding=get_same_padding(9))
+        self.dropout2 = nn.Dropout2d(0.5)
         self.primary_capsules = CapsuleLayer(num_capsules=8, num_route_nodes=-1, in_channels=256, out_channels=32,
                                              kernel_size=9, stride=2)
+
         self.digit_capsules = CapsuleLayer(num_capsules=NUM_CLASSES, num_route_nodes=32 * 8 * 8, in_channels=8,
                                            out_channels=16)
 
@@ -127,7 +130,9 @@ class CapsuleNet(nn.Module):
 
     def forward(self, x, y=None):
         x = F.relu(self.conv1(x), inplace=True)
+        x = self.dropout1(x)
         x = F.relu(self.conv2(x), inplace=True)
+        x = self.dropout2(x)
         x = self.primary_capsules(x)
         x = self.digit_capsules(x).squeeze().transpose(0, 1)
 
@@ -170,6 +175,7 @@ if __name__ == "__main__":
     from torchvision import transforms
     from torchvision.utils import make_grid
     from torchvision.datasets.cifar import CIFAR10
+    from logger import Logger
 
     #root = '/ProxylessGAN'
     root = '.'
@@ -182,38 +188,69 @@ if __name__ == "__main__":
     print("n_gpu: ", ngpu)
 
     model = CapsuleNet().to(device)
+    model.train()
     # model.load_state_dict(torch.load('epochs/epoch_327.pt'))
 
     print("# parameters:", sum(param.numel() for param in model.parameters()))
 
+    logger = Logger(root+'/logs/')
+
     optimizer = Adam(model.parameters(), lr=5e-4)
     capsule_loss = CapsuleLoss()
 
-    train_loader, valid_loader = custom_dl.get_train_valid_loader(data_dir=root+'/data/MNIST/',
+    train_loader, _ = custom_dl.get_train_valid_loader(data_dir=root+'/data/cifar10/',
                                                               batch_size=BATCH_SIZE,
                                                               augment=False,
-                                                              random_seed=1)
-    test_loader = custom_dl.get_test_loader(data_dir=root+'/data/MNIST/', batch_size=BATCH_SIZE)
+                                                              random_seed=1,
+                                                              valid_size=0.0)
+    test_loader = custom_dl.get_test_loader(data_dir=root+'/data/cifar10/', batch_size=BATCH_SIZE)
+
+    clock = 0
 
     for epoch in range(NUM_EPOCHS):
         for i, data in enumerate(train_loader):
             inputs, labels = data
 
             inputs = inputs.to(device)
-            labels = one_hot_embedding(labels, NUM_CLASSES).to(device)
+            one_hot_labels = one_hot_embedding(labels, NUM_CLASSES).to(device)
 
             optimizer.zero_grad()
 
-            classes, reconstructions = model(inputs, labels)
-            loss = capsule_loss(inputs, labels, classes, reconstructions)
+            classes, reconstructions = model(inputs, one_hot_labels)
+            loss = capsule_loss(inputs, one_hot_labels, classes, reconstructions)
 
             loss.backward()
             optimizer.step()
 
-            if i % 100 == 0:
-                print("~[e%d]batch %d~ Loss: %.3f"%(epoch, i, loss.item()))
+            if clock % 100 == 0:
+                _, argmax = torch.max(classes, 1)
+                labels = labels.cpu()
+                argmax = argmax.cpu()
+                inputs = inputs.cpu()
+                accuracy = (labels == argmax.squeeze()).float().mean()
+                print("~[e%d]batch %d~ Loss: %.3f, Acc: %.2f"%(epoch, i, loss.item(), accuracy.item()))
+                # 1. Log scalar values (scalar summary)
+                info = {'loss': loss.item(), 'accuracy': accuracy.item()}
+
+                for tag, value in info.items():
+                    logger.scalar_summary(tag, value, clock + 1)
+
+                # 2. Log values and gradients of the parameters (histogram summary)
+                for tag, value in model.named_parameters():
+                    tag = tag.replace('.', '/')
+                    logger.histo_summary(tag, value.data.cpu().numpy(), clock+1)
+                    logger.histo_summary(tag+'/grad', value.grad.data.cpu().numpy(), clock+1)
+
+                # 3. Log training images (image summary)
+                info = {'images': inputs.view(-1, 3, 32, 32)[:10, :, :, :].cpu().numpy()}
+
+                for tag, images in info.items():
+                    logger.image_summary(tag, images, clock+1)
+
+            clock += 1
     
     print('FINISHED TRAINING')
+    model.eval()
 
     correct = 0
     total = 0
