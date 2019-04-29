@@ -14,7 +14,7 @@ import numpy as np
 
 import data_loader as custom_dl
 
-BATCH_SIZE = 128
+BATCH_SIZE = 64
 NUM_CLASSES = 10
 NUM_EPOCHS = 100
 NUM_ROUTING_ITERATIONS = 3
@@ -110,9 +110,9 @@ class CapsuleNet(nn.Module):
         super(CapsuleNet, self).__init__()
 
         self.conv1 = nn.Conv2d(in_channels=CHANNELS, out_channels=512, kernel_size=9, stride=1)
-        self.dropout1 = nn.Dropout2d(0.5)
+        self.dropout1 = nn.Dropout2d(0.2)
         self.conv2 = nn.Conv2d(in_channels=512, out_channels=256, kernel_size=9, stride=1, padding=get_same_padding(9))
-        self.dropout2 = nn.Dropout2d(0.5)
+        self.dropout2 = nn.Dropout2d(0.2)
         self.primary_capsules = CapsuleLayer(num_capsules=8, num_route_nodes=-1, in_channels=256, out_channels=32,
                                              kernel_size=9, stride=2)
 
@@ -198,16 +198,17 @@ if __name__ == "__main__":
     optimizer = Adam(model.parameters(), lr=5e-4)
     capsule_loss = CapsuleLoss()
 
-    train_loader, _ = custom_dl.get_train_valid_loader(data_dir=root+'/data/cifar10/',
+    train_loader, valid_loader = custom_dl.get_train_valid_loader(data_dir=root+'/data/cifar10/',
                                                               batch_size=BATCH_SIZE,
                                                               augment=False,
                                                               random_seed=1,
-                                                              valid_size=0.0)
+                                                              valid_size=0.1)
     test_loader = custom_dl.get_test_loader(data_dir=root+'/data/cifar10/', batch_size=BATCH_SIZE)
 
     clock = 0
 
     for epoch in range(NUM_EPOCHS):
+        model.train()
         for i, data in enumerate(train_loader):
             inputs, labels = data
 
@@ -228,9 +229,9 @@ if __name__ == "__main__":
                 argmax = argmax.cpu()
                 inputs = inputs.cpu()
                 accuracy = (labels == argmax.squeeze()).float().mean()
-                print("~[e%d]batch %d~ Loss: %.3f, Acc: %.2f"%(epoch, i, loss.item(), accuracy.item()))
+                print("~[e%d]batch %d~ Loss: %.3f, Train Acc: %.2f"%(epoch, i, loss.item(), accuracy.item()))
                 # 1. Log scalar values (scalar summary)
-                info = {'loss': loss.item(), 'accuracy': accuracy.item()}
+                info = {'loss': loss.item(), 'train accuracy': accuracy.item()}
 
                 for tag, value in info.items():
                     logger.scalar_summary(tag, value, clock + 1)
@@ -248,6 +249,25 @@ if __name__ == "__main__":
                     logger.image_summary(tag, images, clock+1)
 
             clock += 1
+        
+        # Check validation accuracy after each epoch
+        model.eval()
+        data = next(iter(valid_loader))
+        inputs, labels = data
+        inputs = inputs.to(device)
+        one_hot_labels = one_hot_embedding(labels, NUM_CLASSES).to(device)
+        classes, reconstructions = model(inputs, one_hot_labels)
+        loss = capsule_loss(inputs, one_hot_labels, classes, reconstructions)
+        _, argmax = torch.max(classes, 1)
+        labels = labels.cpu()
+        argmax = argmax.cpu()
+        inputs = inputs.cpu()
+        accuracy = (labels == argmax.squeeze()).float().mean()
+        info = {'validation accuracy': accuracy.item()}
+
+        for tag, value in info.items():
+            logger.scalar_summary(tag, value, clock + 1)
+
     
     print('FINISHED TRAINING')
     model.eval()

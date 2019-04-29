@@ -62,20 +62,20 @@ def get_train_valid_loader(data_dir,
     valid_transform = transforms.Compose([
             transforms.Resize(32),
             transforms.ToTensor(),
-            #normalize,
+            normalize,
     ])
     if augment:
         train_transform = transforms.Compose([
             transforms.Resize(32),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
-            #normalize,
+            normalize,
         ])
     else:
         train_transform = transforms.Compose([
             transforms.Resize(32),
             transforms.ToTensor(),
-            #normalize,
+            normalize,
         ])
 
     # load the dataset
@@ -157,7 +157,7 @@ def get_test_loader(data_dir,
     transform = transforms.Compose([
         transforms.Resize(32),
         transforms.ToTensor(),
-        #normalize,
+        normalize,
     ])
 
     dataset = datasets.CIFAR10(
