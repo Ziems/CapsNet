@@ -6,6 +6,7 @@ PyTorch implementation by Kenta Iwasaki @ Gram.AI.
 """
 import sys
 sys.setrecursionlimit(15000)
+import math
 
 import torch
 import torch.nn.functional as F
@@ -14,9 +15,9 @@ import numpy as np
 
 import data_loader as custom_dl
 
-BATCH_SIZE = 64
+BATCH_SIZE = 32
 NUM_CLASSES = 10
-NUM_EPOCHS = 100
+NUM_EPOCHS = 5
 NUM_ROUTING_ITERATIONS = 3
 CHANNELS = 3
 
@@ -43,130 +44,154 @@ def one_hot_embedding(labels, num_classes):
     y = torch.eye(num_classes) 
     return y[labels] 
 
-def softmax(input, dim=1):
-    transposed_input = input.transpose(dim, len(input.size()) - 1)
-    softmaxed_output = F.softmax(transposed_input.contiguous().view(-1, transposed_input.size(-1)), dim=-1)
-    return softmaxed_output.view(*transposed_input.size()).transpose(dim, len(input.size()) - 1)
+def squash(x):
+    lengths2 = x.pow(2).sum(dim=2)
+    lengths = lengths2.sqrt()
+    x = x * (lengths2 / (1 + lengths2) / lengths).view(x.size(0), x.size(1), 1)
+    return x
 
 
-def augmentation(x, max_shift=2):
-    _, _, height, width = x.size()
+class AgreementRouting(nn.Module):
+    def __init__(self, input_caps, output_caps, n_iterations):
+        super(AgreementRouting, self).__init__()
+        self.n_iterations = n_iterations
+        self.b = nn.Parameter(torch.zeros((input_caps, output_caps)))
 
-    h_shift, w_shift = np.random.randint(-max_shift, max_shift + 1, size=2)
-    source_height_slice = slice(max(0, h_shift), h_shift + height)
-    source_width_slice = slice(max(0, w_shift), w_shift + width)
-    target_height_slice = slice(max(0, -h_shift), -h_shift + height)
-    target_width_slice = slice(max(0, -w_shift), -w_shift + width)
+    def forward(self, u_predict):
+        batch_size, input_caps, output_caps, output_dim = u_predict.size()
 
-    shifted_image = torch.zeros(*x.size())
-    shifted_image[:, :, source_height_slice, source_width_slice] = x[:, :, target_height_slice, target_width_slice]
-    return shifted_image.float()
+        c = F.softmax(self.b)
+        s = (c.unsqueeze(2) * u_predict).sum(dim=1)
+        v = squash(s)
 
+        if self.n_iterations > 0:
+            b_batch = self.b.expand((batch_size, input_caps, output_caps))
+            for r in range(self.n_iterations):
+                v = v.unsqueeze(1)
+                b_batch = b_batch + (u_predict * v).sum(-1)
 
-class CapsuleLayer(nn.Module):
-    def __init__(self, num_capsules, num_route_nodes, in_channels, out_channels, kernel_size=None, stride=None,
-                 num_iterations=NUM_ROUTING_ITERATIONS):
-        super(CapsuleLayer, self).__init__()
+                c = F.softmax(b_batch.view(-1, output_caps)).view(-1, input_caps, output_caps, 1)
+                s = (c * u_predict).sum(dim=1)
+                v = squash(s)
 
-        self.num_route_nodes = num_route_nodes
-        self.num_iterations = num_iterations
-
-        self.num_capsules = num_capsules
-
-        if num_route_nodes != -1:
-            self.route_weights = nn.Parameter(torch.randn(num_capsules, num_route_nodes, in_channels, out_channels))
-        else:
-            self.capsules = nn.ModuleList(
-                [nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=0) for _ in
-                 range(num_capsules)])
-
-    def squash(self, tensor, dim=-1):
-        squared_norm = (tensor ** 2).sum(dim=dim, keepdim=True)
-        scale = squared_norm / (1 + squared_norm)
-        return scale * tensor / torch.sqrt(squared_norm)
-
-    def forward(self, x):
-        if self.num_route_nodes != -1:
-            priors = x[None, :, :, None, :] @ self.route_weights[:, None, :, :, :]
-
-            logits = Variable(torch.zeros(*priors.size())).cuda()
-            for i in range(self.num_iterations):
-                probs = softmax(logits, dim=2)
-                outputs = self.squash((probs * priors).sum(dim=2, keepdim=True))
-
-                if i != self.num_iterations - 1:
-                    delta_logits = (priors * outputs).sum(dim=-1, keepdim=True)
-                    logits = logits + delta_logits
-        else:
-            outputs = [capsule(x).view(x.size(0), -1, 1) for capsule in self.capsules]
-            outputs = torch.cat(outputs, dim=-1)
-            outputs = self.squash(outputs)
-
-        return outputs
+        return v
 
 
-class CapsuleNet(nn.Module):
-    def __init__(self):
-        super(CapsuleNet, self).__init__()
+class CapsLayer(nn.Module):
+    def __init__(self, input_caps, input_dim, output_caps, output_dim, routing_module):
+        super(CapsLayer, self).__init__()
+        self.input_dim = input_dim
+        self.input_caps = input_caps
+        self.output_dim = output_dim
+        self.output_caps = output_caps
+        self.weights = nn.Parameter(torch.Tensor(input_caps, input_dim, output_caps * output_dim))
+        self.routing_module = routing_module
+        self.reset_parameters()
 
-        self.conv1 = nn.Conv2d(in_channels=CHANNELS, out_channels=512, kernel_size=9, stride=1)
-        self.dropout1 = nn.Dropout2d(0.2)
-        self.conv2 = nn.Conv2d(in_channels=512, out_channels=256, kernel_size=9, stride=1, padding=get_same_padding(9))
-        self.dropout2 = nn.Dropout2d(0.2)
-        self.primary_capsules = CapsuleLayer(num_capsules=8, num_route_nodes=-1, in_channels=256, out_channels=32,
-                                             kernel_size=9, stride=2)
+    def reset_parameters(self):
+        stdv = 1. / math.sqrt(self.input_caps)
+        self.weights.data.uniform_(-stdv, stdv)
 
-        self.digit_capsules = CapsuleLayer(num_capsules=NUM_CLASSES, num_route_nodes=32 * 8 * 8, in_channels=8,
-                                           out_channels=16)
-
-        self.decoder = nn.Sequential(
-            nn.Linear(16 * NUM_CLASSES, 512),
-            nn.ReLU(inplace=True),
-            nn.Linear(512, 1024),
-            nn.ReLU(inplace=True),
-            nn.Linear(1024, 32 * 32 * CHANNELS),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x, y=None):
-        x = F.relu(self.conv1(x), inplace=True)
-        x = self.dropout1(x)
-        x = F.relu(self.conv2(x), inplace=True)
-        x = self.dropout2(x)
-        x = self.primary_capsules(x)
-        x = self.digit_capsules(x).squeeze().transpose(0, 1)
-
-        classes = (x ** 2).sum(dim=-1) ** 0.5
-        classes = F.softmax(classes, dim=-1)
-
-        if y is None:
-            # In all batches, get the most active capsule.
-            _, max_length_indices = classes.max(dim=1)
-            y = Variable(torch.eye(NUM_CLASSES)).cuda().index_select(dim=0, index=max_length_indices.data)
-
-        reconstruction_inputs = (x * y[:, :, None]).view(x.size(0), -1)
-        reconstructions = self.decoder(reconstruction_inputs)
-
-        return classes, reconstructions
+    def forward(self, caps_output):
+        caps_output = caps_output.unsqueeze(2)
+        u_predict = caps_output.matmul(self.weights)
+        u_predict = u_predict.view(u_predict.size(0), self.input_caps, self.output_caps, self.output_dim)
+        v = self.routing_module(u_predict)
+        return v
 
 
-class CapsuleLoss(nn.Module):
-    def __init__(self):
-        super(CapsuleLoss, self).__init__()
-        self.reconstruction_loss = nn.MSELoss(size_average=False)
+class PrimaryCapsLayer(nn.Module):
+    def __init__(self, input_channels, output_caps, output_dim, kernel_size, stride, padding):
+        super(PrimaryCapsLayer, self).__init__()
+        self.conv = nn.Conv2d(input_channels, output_caps * output_dim, kernel_size=kernel_size, stride=stride, padding=padding)
+        self.input_channels = input_channels
+        self.output_caps = output_caps
+        self.output_dim = output_dim
 
-    def forward(self, images, labels, classes, reconstructions):
-        left = F.relu(0.9 - classes, inplace=True) ** 2
-        right = F.relu(classes - 0.1, inplace=True) ** 2
+    def forward(self, input):
+        out = self.conv(input)
+        N, C, H, W = out.size()
+        out = out.view(N, self.output_caps, self.output_dim, H, W)
 
-        margin_loss = labels * left + 0.5 * (1. - labels) * right
-        margin_loss = margin_loss.sum()
+        # will output N x OUT_CAPS x OUT_DIM
+        out = out.permute(0, 1, 3, 4, 2).contiguous()
+        out = out.view(out.size(0), -1, out.size(4))
+        out = squash(out)
+        return out
 
-        assert torch.numel(images) == torch.numel(reconstructions)
-        images = images.view(reconstructions.size()[0], -1)
-        reconstruction_loss = self.reconstruction_loss(reconstructions, images)
 
-        return (margin_loss + 0.0005 * reconstruction_loss) / images.size(0)
+class CapsNet(nn.Module):
+    def __init__(self, routing_iterations, n_classes=10):
+        super(CapsNet, self).__init__()
+        self.conv1 = nn.Conv2d(3, 256, kernel_size=9, stride=1)
+        self.primaryCaps = PrimaryCapsLayer(256, 32, 8, kernel_size=9, stride=2,padding=0)  # outputs 6*6
+        self.num_primaryCaps = 32 * 8 * 8
+        routing_module1 = AgreementRouting(self.num_primaryCaps, 64, routing_iterations)
+        self.cap1 = CapsLayer(self.num_primaryCaps, 8, 64, 16, routing_module1)
+        routing_module2 = AgreementRouting(64, n_classes, routing_iterations)
+        self.digitCaps = CapsLayer(64, 16, n_classes, 16, routing_module2)
+
+    def forward(self, input):
+        x = self.conv1(input)
+        x = F.relu(x)
+        x = self.primaryCaps(x)
+        x = self.cap1(x)
+        x = self.digitCaps(x)
+        probs = x.pow(2).sum(dim=2).sqrt()
+        return x, probs
+
+
+class ReconstructionNet(nn.Module):
+    def __init__(self, n_dim=16, n_classes=10):
+        super(ReconstructionNet, self).__init__()
+        self.fc1 = nn.Linear(n_dim * n_classes, 512)
+        self.fc2 = nn.Linear(512, 1024)
+        self.fc3 = nn.Linear(1024, 784)
+        self.n_dim = n_dim
+        self.n_classes = n_classes
+
+    def forward(self, x, target):
+        mask = Variable(torch.zeros((x.size()[0], self.n_classes)), requires_grad=False)
+        if next(self.parameters()).is_cuda:
+            mask = mask.cuda()
+        mask.scatter_(1, target.view(-1, 1), 1.)
+        mask = mask.unsqueeze(2)
+        x = x * mask
+        x = x.view(-1, self.n_dim * self.n_classes)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = F.sigmoid(self.fc3(x))
+        return x
+
+
+class CapsNetWithReconstruction(nn.Module):
+    def __init__(self, caps_net, reconstruction_net):
+        super(CapsNetWithReconstruction, self).__init__()
+        self.caps_net = caps_net
+        self.reconstruction_net = reconstruction_net
+
+    def forward(self, x, target):
+        x, probs = self.caps_net(x)
+        reconstruction = self.reconstruction_net(x, target)
+        return reconstruction, probs
+
+
+class MarginLoss(nn.Module):
+    def __init__(self, m_pos, m_neg, lambda_):
+        super(MarginLoss, self).__init__()
+        self.m_pos = m_pos
+        self.m_neg = m_neg
+        self.lambda_ = lambda_
+
+    def forward(self, lengths, targets, size_average=True):
+        t = torch.zeros(lengths.size()).long()
+        if targets.is_cuda:
+            t = t.cuda()
+        t = t.scatter_(1, targets.data.view(-1, 1), 1)
+        targets = Variable(t)
+        losses = targets.float() * F.relu(self.m_pos - lengths).pow(2) + \
+                 self.lambda_ * (1. - targets.float()) * F.relu(lengths - self.m_neg).pow(2)
+        return losses.mean() if size_average else losses.sum()
 
 
 if __name__ == "__main__":
@@ -187,16 +212,16 @@ if __name__ == "__main__":
 
     print("n_gpu: ", ngpu)
 
-    model = CapsuleNet().to(device)
+    model = CapsNet(routing_iterations=3, n_classes=10).to(device)
     model.train()
     # model.load_state_dict(torch.load('epochs/epoch_327.pt'))
 
     print("# parameters:", sum(param.numel() for param in model.parameters()))
 
-    logger = Logger(root+'/logs/')
+    logger = Logger(root+'/logs/junk/')
 
     optimizer = Adam(model.parameters(), lr=5e-4)
-    capsule_loss = CapsuleLoss()
+    capsule_loss = MarginLoss(0.9, 0.1, 0.5)
 
     train_loader, valid_loader = custom_dl.get_train_valid_loader(data_dir=root+'/data/cifar10/',
                                                               batch_size=BATCH_SIZE,
@@ -213,18 +238,19 @@ if __name__ == "__main__":
             inputs, labels = data
 
             inputs = inputs.to(device)
-            one_hot_labels = one_hot_embedding(labels, NUM_CLASSES).to(device)
+            labels = labels.to(device)
+            # one_hot_labels = one_hot_embedding(labels, NUM_CLASSES).to(device)
 
             optimizer.zero_grad()
 
-            classes, reconstructions = model(inputs, one_hot_labels)
-            loss = capsule_loss(inputs, one_hot_labels, classes, reconstructions)
+            x, class_probs = model(inputs)
+            loss = capsule_loss(class_probs, labels)
 
             loss.backward()
             optimizer.step()
 
             if clock % 100 == 0:
-                _, argmax = torch.max(classes, 1)
+                _, argmax = torch.max(class_probs, 1)
                 labels = labels.cpu()
                 argmax = argmax.cpu()
                 inputs = inputs.cpu()
@@ -251,22 +277,22 @@ if __name__ == "__main__":
             clock += 1
         
         # Check validation accuracy after each epoch
-        model.eval()
-        data = next(iter(valid_loader))
-        inputs, labels = data
-        inputs = inputs.to(device)
-        one_hot_labels = one_hot_embedding(labels, NUM_CLASSES).to(device)
-        classes, reconstructions = model(inputs, one_hot_labels)
-        loss = capsule_loss(inputs, one_hot_labels, classes, reconstructions)
-        _, argmax = torch.max(classes, 1)
-        labels = labels.cpu()
-        argmax = argmax.cpu()
-        inputs = inputs.cpu()
-        accuracy = (labels == argmax.squeeze()).float().mean()
-        info = {'validation accuracy': accuracy.item()}
+        # model.eval()
+        # data = next(iter(valid_loader))
+        # inputs, labels = data
+        # inputs = inputs.to(device)
+        # labels = labels.to(device)
+        # classes, reconstructions = model(inputs)
+        # loss = capsule_loss(inputs, one_hot_labels, classes, reconstructions)
+        # _, argmax = torch.max(classes, 1)
+        # labels = labels.cpu()
+        # argmax = argmax.cpu()
+        # inputs = inputs.cpu()
+        # accuracy = (labels == argmax.squeeze()).float().mean()
+        # info = {'validation accuracy': accuracy.item()}
 
-        for tag, value in info.items():
-            logger.scalar_summary(tag, value, clock + 1)
+        # for tag, value in info.items():
+        #     logger.scalar_summary(tag, value, clock + 1)
 
     
     print('FINISHED TRAINING')
@@ -279,8 +305,8 @@ if __name__ == "__main__":
             images, labels = data
             images = images.to(device)
             labels = labels.to(device)
-            outputs, _ = model(images)
-            _, predicted = torch.max(outputs.data, 1)
+            x, class_probs = model(images)
+            _, predicted = torch.max(class_probs.data, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
 
